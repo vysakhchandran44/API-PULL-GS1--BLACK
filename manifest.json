@@ -1,13 +1,12 @@
 {
-  "name": "GS1 Barcode Parser",
-  "short_name": "GS1 Parser",
-  "description": "Offline-first Progressive Web App for parsing GS1 barcodes and matching products",
-  "start_url": "/",
+  "name": "Oasis Pharmacy Tracker",
+  "short_name": "Oasis Pharmacy",
+  "description": "GS1 Barcode Scanner for Pharmacy Expiry Tracking",
+  "start_url": "./index.html",
   "display": "standalone",
-  "background_color": "#0a0e14",
-  "theme_color": "#0f172a",
-  "orientation": "any",
-  "scope": "/",
+  "orientation": "portrait",
+  "theme_color": "#6C63FF",
+  "background_color": "#F5F7FB",
   "icons": [
     {
       "src": "icons/icon-72.png",
@@ -58,24 +57,5 @@
       "purpose": "any maskable"
     }
   ],
-  "categories": ["utilities", "productivity", "business"],
-  "screenshots": [],
-  "shortcuts": [
-    {
-      "name": "Scan Barcode",
-      "short_name": "Scan",
-      "description": "Open camera scanner",
-      "url": "/?tab=scan",
-      "icons": [{ "src": "icons/icon-96.png", "sizes": "96x96" }]
-    },
-    {
-      "name": "View History",
-      "short_name": "History",
-      "description": "View scan history",
-      "url": "/?tab=history",
-      "icons": [{ "src": "icons/icon-96.png", "sizes": "96x96" }]
-    }
-  ],
-  "related_applications": [],
-  "prefer_related_applications": false
+  "categories": ["medical", "utilities", "productivity"]
 }

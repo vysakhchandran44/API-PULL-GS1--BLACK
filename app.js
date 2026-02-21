@@ -1,1446 +1,899 @@
 /**
- * GS1 Parser PWA - Offline-first Progressive Web App
- * For parsing GS1 barcodes and matching products from master data
+ * Oasis Pharmacy - Tracker v3.0
+ * GS1 Barcode Scanner PWA
+ * 
+ * Features:
+ * - PIN protected editing (5-min timeout)
+ * - Master data persists until changed
+ * - 10 recent scans on home
+ * - CSV export only
+ * - Medicine API lookup
  */
 
-// ============================================================================
-// STATE MANAGEMENT
-// ============================================================================
-
-const AppState = {
-  masterLoaded: false,
-  masterCount: 0,
-  masterData: [],
-  masterIndex: {
-    exact: new Map(),
-    last8: new Map(),
-  },
-  masterLastUpdated: null,
-  historyRows: [],
-  currentTab: 'scan',
-  filters: {
-    expired: false,
-    soon: false,
-    missing: false,
-    search: ''
-  },
-  sorting: {
-    field: 'time',
-    direction: 'desc'
-  },
-  pagination: {
-    page: 1,
-    perPage: 50
-  },
-  scanning: false,
-  cameraStream: null,
-  scannerInstance: null,
-  pendingMasterFile: null,
-  pendingMasterData: null
+const CONFIG = {
+  PIN: '9633',
+  PIN_TIMEOUT: 5 * 60 * 1000,
+  EXPIRY_SOON_DAYS: 90,
+  MAX_RECENT_SCANS: 10,
+  DEBOUNCE_MS: 2000,
+  API: {
+    OPEN_FDA: 'https://api.fda.gov/drug/ndc.json',
+    DAILYMED: 'https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json',
+    OPEN_FOOD_FACTS: 'https://world.openfoodfacts.org/api/v0/product/'
+  }
 };
 
-// ============================================================================
-// DATABASE (IndexedDB)
-// ============================================================================
+const State = {
+  scanning: false,
+  lastScan: { code: '', time: 0 },
+  scanner: null,
+  masterData: new Map(),
+  masterIndex: { exact: new Map(), last8: new Map() },
+  history: [],
+  filteredHistory: [],
+  currentPage: 'home',
+  searchQuery: '',
+  activeFilter: 'all',
+  pinCallback: null,
+  pinInput: '',
+  lastPinSuccess: 0,
+  editingEntry: null,
+  apiLookupEnabled: true,
+  hapticEnabled: true
+};
 
-const DB_NAME = 'gs1-parser-db';
-const DB_VERSION = 1;
-let db = null;
-
-async function initDB() {
-  return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, DB_VERSION);
-    request.onerror = () => reject(request.error);
-    request.onsuccess = () => {
-      db = request.result;
-      resolve(db);
-    };
-    request.onupgradeneeded = (event) => {
-      const database = event.target.result;
-      if (!database.objectStoreNames.contains('history')) {
-        const historyStore = database.createObjectStore('history', { keyPath: 'id', autoIncrement: true });
-        historyStore.createIndex('scanTime', 'scanTime', { unique: false });
-        historyStore.createIndex('gtin14', 'gtin14', { unique: false });
-        historyStore.createIndex('expiry', 'expiry', { unique: false });
-      }
-      if (!database.objectStoreNames.contains('master')) {
-        const masterStore = database.createObjectStore('master', { keyPath: 'gtin' });
-        masterStore.createIndex('name', 'name', { unique: false });
-      }
-      if (!database.objectStoreNames.contains('settings')) {
-        database.createObjectStore('settings', { keyPath: 'key' });
-      }
-    };
-  });
-}
-
-async function saveHistory(entry) {
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction('history', 'readwrite');
-    const store = tx.objectStore('history');
-    const request = store.add(entry);
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
-  });
-}
-
-async function loadAllHistory() {
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction('history', 'readonly');
-    const store = tx.objectStore('history');
-    const request = store.getAll();
-    request.onsuccess = () => resolve(request.result || []);
-    request.onerror = () => reject(request.error);
-  });
-}
-
-async function clearHistory() {
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction('history', 'readwrite');
-    const store = tx.objectStore('history');
-    const request = store.clear();
-    request.onsuccess = () => resolve();
-    request.onerror = () => reject(request.error);
-  });
-}
-
-async function saveMasterData(data) {
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction('master', 'readwrite');
-    const store = tx.objectStore('master');
-    store.clear();
-    data.forEach(item => store.put(item));
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  });
-}
-
-async function appendMasterData(data) {
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction('master', 'readwrite');
-    const store = tx.objectStore('master');
-    data.forEach(item => store.put(item));
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  });
-}
-
-async function loadMasterData() {
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction('master', 'readonly');
-    const store = tx.objectStore('master');
-    const request = store.getAll();
-    request.onsuccess = () => resolve(request.result || []);
-    request.onerror = () => reject(request.error);
-  });
-}
-
-async function clearMasterData() {
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction('master', 'readwrite');
-    const store = tx.objectStore('master');
-    const request = store.clear();
-    request.onsuccess = () => resolve();
-    request.onerror = () => reject(request.error);
-  });
-}
-
-async function saveSetting(key, value) {
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction('settings', 'readwrite');
-    const store = tx.objectStore('settings');
-    const request = store.put({ key, value });
-    request.onsuccess = () => resolve();
-    request.onerror = () => reject(request.error);
-  });
-}
-
-async function loadSetting(key) {
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction('settings', 'readonly');
-    const store = tx.objectStore('settings');
-    const request = store.get(key);
-    request.onsuccess = () => resolve(request.result?.value);
-    request.onerror = () => reject(request.error);
-  });
-}
-
-// ============================================================================
-// GS1 PARSING
-// ============================================================================
-
-function parseGs1(raw) {
-  if (!raw || typeof raw !== 'string') {
-    return { valid: false, error: 'Empty or invalid input' };
-  }
-
-  let cleanedRaw = raw.trim();
-  cleanedRaw = cleanedRaw.replace(/[\x1d\u001d]/g, '|');
+// Database
+const DB = {
+  name: 'oasis-pharmacy-v3',
+  version: 1,
+  instance: null,
   
-  if (!cleanedRaw.includes('(')) {
-    cleanedRaw = convertRawToParenthesized(cleanedRaw);
+  async init() {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open(this.name, this.version);
+      req.onerror = () => reject(req.error);
+      req.onsuccess = () => { this.instance = req.result; resolve(); };
+      req.onupgradeneeded = (e) => {
+        const db = e.target.result;
+        if (!db.objectStoreNames.contains('history')) {
+          const store = db.createObjectStore('history', { keyPath: 'id', autoIncrement: true });
+          store.createIndex('gtin14', 'gtin14');
+          store.createIndex('gtinBatch', ['gtin14', 'batch']);
+        }
+        if (!db.objectStoreNames.contains('master')) {
+          db.createObjectStore('master', { keyPath: 'gtin' });
+        }
+        if (!db.objectStoreNames.contains('settings')) {
+          db.createObjectStore('settings', { keyPath: 'key' });
+        }
+      };
+    });
+  },
+  
+  async put(store, data) {
+    return new Promise((resolve, reject) => {
+      const tx = this.instance.transaction(store, 'readwrite');
+      const req = tx.objectStore(store).put(data);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  },
+  
+  async get(store, key) {
+    return new Promise((resolve, reject) => {
+      const tx = this.instance.transaction(store, 'readonly');
+      const req = tx.objectStore(store).get(key);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  },
+  
+  async getAll(store) {
+    return new Promise((resolve, reject) => {
+      const tx = this.instance.transaction(store, 'readonly');
+      const req = tx.objectStore(store).getAll();
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  },
+  
+  async delete(store, key) {
+    return new Promise((resolve, reject) => {
+      const tx = this.instance.transaction(store, 'readwrite');
+      const req = tx.objectStore(store).delete(key);
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
+    });
+  },
+  
+  async clear(store) {
+    return new Promise((resolve, reject) => {
+      const tx = this.instance.transaction(store, 'readwrite');
+      const req = tx.objectStore(store).clear();
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
+    });
+  },
+  
+  async findByGtinBatch(gtin14, batch) {
+    return new Promise((resolve, reject) => {
+      const tx = this.instance.transaction('history', 'readonly');
+      const idx = tx.objectStore('history').index('gtinBatch');
+      const req = idx.get([gtin14, batch || '']);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
   }
+};
 
-  const result = {
-    valid: true,
-    raw: raw,
-    gtin14: '',
-    gtin13: '',
-    expiry: '',
-    expiryFormatted: '',
-    expiryStatus: 'missing',
-    batch: '',
-    serial: '',
-    qty: '1',
-    productName: '',
-    matchType: 'NONE'
-  };
+// Haptic
+const Haptic = {
+  light() { if (State.hapticEnabled && navigator.vibrate) navigator.vibrate(10); },
+  medium() { if (State.hapticEnabled && navigator.vibrate) navigator.vibrate(30); },
+  success() { if (State.hapticEnabled && navigator.vibrate) navigator.vibrate([30, 50, 30]); },
+  error() { if (State.hapticEnabled && navigator.vibrate) navigator.vibrate([100, 50, 100]); }
+};
 
-  const aiPatterns = {
-    '01': /\(01\)(\d{14})/,
-    '01short': /\(01\)(\d{12,13})/,
-    '17': /\(17\)(\d{6})/,
-    '10': /\(10\)([A-Za-z0-9\-\/\.\s]+?)(?=\([0-9]{2}\)|$)/,
-    '21': /\(21\)([A-Za-z0-9\-\/\.\s]+?)(?=\([0-9]{2}\)|$)/,
-    '30': /\(30\)(\d+)/
-  };
-
-  const gtinMatch = cleanedRaw.match(aiPatterns['01']);
+// GS1 Parsing
+function parseGS1(raw) {
+  const result = { valid: false, raw, gtin14: '', gtin13: '', expiry: null, expiryFormatted: '', expiryStatus: 'missing', batch: '', serial: '', qty: 1 };
+  if (!raw || typeof raw !== 'string') return result;
+  
+  let code = raw.trim().replace(/\x1d/g, '|');
+  
+  if (/^\d{8,14}$/.test(code) && !code.includes('(')) {
+    result.gtin14 = code.padStart(14, '0');
+    result.gtin13 = result.gtin14.startsWith('0') ? result.gtin14.substring(1) : result.gtin14;
+    result.valid = true;
+    return result;
+  }
+  
+  if (!code.includes('(') && /^\d{2}/.test(code)) {
+    code = convertToParenthesized(code);
+  }
+  
+  const gtinMatch = code.match(/\(01\)(\d{12,14})/);
   if (gtinMatch) {
-    result.gtin14 = gtinMatch[1];
-    if (result.gtin14.startsWith('0')) {
-      result.gtin13 = result.gtin14.substring(1);
-    } else {
-      result.gtin13 = result.gtin14;
-    }
-  } else {
-    const shortGtinMatch = cleanedRaw.match(aiPatterns['01short']);
-    if (shortGtinMatch) {
-      result.gtin13 = shortGtinMatch[1].padStart(13, '0');
-      result.gtin14 = result.gtin13.padStart(14, '0');
-    }
+    result.gtin14 = gtinMatch[1].padStart(14, '0');
+    result.gtin13 = result.gtin14.startsWith('0') ? result.gtin14.substring(1) : result.gtin14;
+    result.valid = true;
   }
-
-  const expiryMatch = cleanedRaw.match(aiPatterns['17']);
+  
+  const expiryMatch = code.match(/\(17\)(\d{6})/);
   if (expiryMatch) {
-    const parsed = parseGS1Date(expiryMatch[1]);
-    result.expiry = parsed.iso;
-    result.expiryFormatted = parsed.formatted;
-    result.expiryStatus = getExpiryStatus(parsed.iso);
+    const p = parseExpiryDate(expiryMatch[1]);
+    result.expiry = p.iso;
+    result.expiryFormatted = p.formatted;
+    result.expiryStatus = getExpiryStatus(p.date);
   }
-
-  const batchMatch = cleanedRaw.match(aiPatterns['10']);
-  if (batchMatch) {
-    result.batch = batchMatch[1].trim();
-  }
-
-  const serialMatch = cleanedRaw.match(aiPatterns['21']);
-  if (serialMatch) {
-    result.serial = serialMatch[1].trim();
-  }
-
-  const qtyMatch = cleanedRaw.match(aiPatterns['30']);
-  if (qtyMatch) {
-    result.qty = qtyMatch[1];
-  }
-
-  if (!result.gtin14 && !result.gtin13) {
-    result.valid = false;
-    result.matchType = 'INVALID';
-    result.error = 'No valid GTIN found';
-  }
-
+  
+  const batchMatch = code.match(/\(10\)([^\(|\x1d]+)/);
+  if (batchMatch) result.batch = batchMatch[1].replace(/\|/g, '').trim();
+  
+  const serialMatch = code.match(/\(21\)([^\(|\x1d]+)/);
+  if (serialMatch) result.serial = serialMatch[1].replace(/\|/g, '').trim();
+  
+  const qtyMatch = code.match(/\(30\)(\d+)/);
+  if (qtyMatch) result.qty = parseInt(qtyMatch[1], 10) || 1;
+  
   return result;
 }
 
-function convertRawToParenthesized(raw) {
-  const aiLengths = {
-    '01': 14, '02': 14, '10': 0, '11': 6, '12': 6, '13': 6,
-    '15': 6, '16': 6, '17': 6, '20': 2, '21': 0, '22': 0,
-    '30': 0, '37': 0, '240': 0, '241': 0, '242': 0, '250': 0, '251': 0
-  };
-
-  let result = '';
-  const parts = raw.split('|');
-
-  for (const part of parts) {
-    let i = 0;
-    while (i < part.length) {
-      let ai = null;
-      let aiLen = 0;
-
-      if (i + 3 <= part.length) {
-        const ai3 = part.substring(i, i + 3);
-        if (aiLengths[ai3] !== undefined) {
-          ai = ai3;
-          aiLen = aiLengths[ai3];
-        }
-      }
-
-      if (!ai && i + 2 <= part.length) {
-        const ai2 = part.substring(i, i + 2);
-        if (aiLengths[ai2] !== undefined) {
-          ai = ai2;
-          aiLen = aiLengths[ai2];
-        }
-      }
-
-      if (ai) {
-        const valueStart = i + ai.length;
-        let valueEnd;
-        if (aiLen > 0) {
-          valueEnd = Math.min(valueStart + aiLen, part.length);
+function convertToParenthesized(code) {
+  let result = '', pos = 0;
+  const aiLengths = { '01': 14, '02': 14, '10': 'v', '11': 6, '13': 6, '15': 6, '17': 6, '20': 2, '21': 'v', '30': 'v', '37': 'v' };
+  
+  while (pos < code.length) {
+    let matched = false;
+    for (const [ai, len] of Object.entries(aiLengths)) {
+      if (code.substring(pos).startsWith(ai)) {
+        pos += ai.length;
+        let value;
+        if (len === 'v') {
+          const sep = code.indexOf('|', pos);
+          value = sep !== -1 ? code.substring(pos, sep) : code.substring(pos);
+          pos = sep !== -1 ? sep + 1 : code.length;
         } else {
-          valueEnd = part.length;
+          value = code.substring(pos, pos + len);
+          pos += len;
         }
-        const value = part.substring(valueStart, valueEnd);
         result += `(${ai})${value}`;
-        i = valueEnd;
-      } else {
-        i++;
+        matched = true;
+        break;
       }
     }
+    if (!matched) pos++;
   }
-
-  return result || raw;
+  return result || code;
 }
 
-function parseGS1Date(dateStr) {
-  if (!dateStr || dateStr.length !== 6) {
-    return { iso: '', formatted: '' };
-  }
-
-  const yy = parseInt(dateStr.substring(0, 2), 10);
-  const mm = parseInt(dateStr.substring(2, 4), 10);
-  let dd = parseInt(dateStr.substring(4, 6), 10);
-
-  const year = 2000 + yy;
-
-  if (dd === 0) {
-    dd = new Date(year, mm, 0).getDate();
-  }
-
-  if (mm < 1 || mm > 12 || dd < 1 || dd > 31) {
-    return { iso: '', formatted: '' };
-  }
-
-  const iso = `${year}-${String(mm).padStart(2, '0')}-${String(dd).padStart(2, '0')}`;
-  const formatted = `${String(dd).padStart(2, '0')}/${String(mm).padStart(2, '0')}/${year}`;
-
-  return { iso, formatted };
+function parseExpiryDate(yymmdd) {
+  const yy = parseInt(yymmdd.substring(0, 2), 10);
+  const mm = parseInt(yymmdd.substring(2, 4), 10);
+  let dd = parseInt(yymmdd.substring(4, 6), 10);
+  const year = yy >= 50 ? 1900 + yy : 2000 + yy;
+  if (dd === 0) dd = new Date(year, mm, 0).getDate();
+  const date = new Date(year, mm - 1, dd);
+  return {
+    date,
+    iso: date.toISOString().split('T')[0],
+    formatted: `${String(dd).padStart(2, '0')}/${String(mm).padStart(2, '0')}/${year}`
+  };
 }
 
-function getExpiryStatus(isoDate) {
-  if (!isoDate) return 'missing';
-
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  
-  const expiry = new Date(isoDate);
-  expiry.setHours(0, 0, 0, 0);
-
-  const diffDays = Math.ceil((expiry - today) / (1000 * 60 * 60 * 24));
-
-  if (diffDays < 0) return 'expired';
-  if (diffDays <= 30) return 'soon';
+function getExpiryStatus(date) {
+  if (!date) return 'missing';
+  const now = new Date(); now.setHours(0,0,0,0);
+  const exp = new Date(date); exp.setHours(0,0,0,0);
+  const diff = Math.ceil((exp - now) / 86400000);
+  if (diff < 0) return 'expired';
+  if (diff <= CONFIG.EXPIRY_SOON_DAYS) return 'expiring';
   return 'ok';
 }
 
-// ============================================================================
-// MASTER DATA MATCHING
-// ============================================================================
-
-function buildMasterIndex(data) {
-  const index = {
-    exact: new Map(),
-    last8: new Map()
-  };
-
-  for (const item of data) {
-    const gtin = String(item.gtin).replace(/\D/g, '').padStart(14, '0');
-    const name = item.name || '';
-
-    index.exact.set(gtin, name);
+// Master Data
+async function loadMasterData() {
+  try {
+    const data = await DB.getAll('master');
+    State.masterData.clear();
+    State.masterIndex.exact.clear();
+    State.masterIndex.last8.clear();
     
-    if (gtin.startsWith('0')) {
-      index.exact.set(gtin.substring(1), name);
-    }
-
-    const last8 = gtin.slice(-8);
-    if (!index.last8.has(last8)) {
-      index.last8.set(last8, []);
-    }
-    index.last8.get(last8).push({ gtin, name });
-  }
-
-  return index;
+    data.forEach(item => {
+      State.masterData.set(item.gtin, item);
+      const g14 = item.gtin.padStart(14, '0');
+      State.masterIndex.exact.set(g14, item);
+      const l8 = g14.slice(-8);
+      if (!State.masterIndex.last8.has(l8)) State.masterIndex.last8.set(l8, []);
+      State.masterIndex.last8.get(l8).push(item);
+    });
+    
+    updateMasterStats();
+  } catch (err) { console.error('Load master failed:', err); }
 }
 
-function matchProduct(parsed, index) {
-  if (!parsed.valid) {
-    return { name: '', matchType: 'INVALID' };
+async function saveMasterData(items) {
+  try {
+    await DB.clear('master');
+    for (const item of items) await DB.put('master', item);
+    await DB.put('settings', { key: 'masterUpdated', value: new Date().toISOString() });
+    await loadMasterData();
+    showToast(`Loaded ${items.length} products`, 'success');
+  } catch (err) {
+    console.error('Save master failed:', err);
+    showToast('Failed to save', 'error');
   }
-
-  if (!index || !index.exact || index.exact.size === 0) {
-    return { name: '', matchType: 'NONE' };
-  }
-
-  const gtin14 = parsed.gtin14;
-  const gtin13 = parsed.gtin13;
-
-  if (index.exact.has(gtin14)) {
-    return { name: index.exact.get(gtin14), matchType: 'EXACT' };
-  }
-  if (index.exact.has(gtin13)) {
-    return { name: index.exact.get(gtin13), matchType: 'EXACT' };
-  }
-
-  const last8 = gtin14.slice(-8);
-  if (index.last8.has(last8)) {
-    const matches = index.last8.get(last8);
-    if (matches.length === 1) {
-      return { name: matches[0].name, matchType: 'LAST8' };
-    } else if (matches.length > 1) {
-      return { name: '', matchType: 'AMBIGUOUS-LAST8' };
-    }
-  }
-
-  const last10 = gtin14.slice(-10);
-  const seq6Matches = [];
-
-  for (let i = 0; i <= last10.length - 6; i++) {
-    const seq6 = last10.substring(i, i + 6);
-    
-    for (const [gtin, name] of index.exact) {
-      if (gtin.includes(seq6)) {
-        const existing = seq6Matches.find(m => m.gtin === gtin);
-        if (!existing) {
-          seq6Matches.push({ gtin, name });
-        }
-      }
-    }
-  }
-
-  if (seq6Matches.length === 1) {
-    return { name: seq6Matches[0].name, matchType: 'SEQ6' };
-  } else if (seq6Matches.length > 1) {
-    return { name: '', matchType: 'AMBIGUOUS-SEQ6' };
-  }
-
-  return { name: '', matchType: 'NONE' };
 }
 
-// ============================================================================
-// CSV/TSV PARSING
-// ============================================================================
-
-function parseMasterFile(content, filename) {
-  const firstLine = content.split('\n')[0];
-  let delimiter = ',';
-  if (firstLine.includes('\t')) delimiter = '\t';
-  else if ((firstLine.match(/;/g) || []).length > (firstLine.match(/,/g) || []).length) delimiter = ';';
-
-  const lines = content.split(/\r?\n/).filter(line => line.trim());
-  if (lines.length === 0) return [];
-
-  const headerLine = lines[0].toLowerCase();
-  const headers = parseCSVLine(headerLine, delimiter);
+function parseMasterCSV(text) {
+  const lines = text.split(/\r?\n/).filter(l => l.trim());
+  if (lines.length < 2) return [];
+  const delim = text.includes('\t') ? '\t' : ',';
+  const headers = lines[0].toLowerCase().split(delim).map(h => h.trim().replace(/"/g, ''));
+  const gtinCol = headers.findIndex(h => /gtin|ean|barcode|code|upc/i.test(h));
+  const nameCol = headers.findIndex(h => /name|product|description|item/i.test(h));
+  if (gtinCol === -1 || nameCol === -1) { showToast('Need GTIN and Name columns', 'error'); return []; }
   
-  let gtinCol = headers.findIndex(h => 
-    h.includes('gtin') || h.includes('barcode') || h.includes('ean') || h.includes('upc') || h.includes('code')
-  );
-  let nameCol = headers.findIndex(h => 
-    h.includes('name') || h.includes('description') || h.includes('product') || h.includes('item')
-  );
-
-  if (gtinCol === -1) gtinCol = 0;
-  if (nameCol === -1) nameCol = 1;
-
-  const data = [];
+  const items = [];
   for (let i = 1; i < lines.length; i++) {
-    const cols = parseCSVLine(lines[i], delimiter);
-    if (cols.length > Math.max(gtinCol, nameCol)) {
-      const gtin = cols[gtinCol].replace(/[^0-9]/g, '');
-      const name = cols[nameCol].trim();
-      if (gtin && gtin.length >= 8) {
-        data.push({ gtin, name });
-      }
+    const vals = lines[i].split(delim).map(v => v.trim().replace(/^"|"$/g, ''));
+    if (vals[gtinCol] && vals[nameCol]) {
+      items.push({ gtin: vals[gtinCol].replace(/\D/g, '').padStart(14, '0'), name: vals[nameCol] });
     }
   }
-
-  return data;
+  return items;
 }
 
-function parseCSVLine(line, delimiter) {
-  const result = [];
-  let current = '';
-  let inQuotes = false;
+function matchProduct(gtin14) {
+  if (State.masterIndex.exact.has(gtin14)) return { product: State.masterIndex.exact.get(gtin14), matchType: 'exact' };
+  const l8 = gtin14.slice(-8);
+  if (State.masterIndex.last8.has(l8)) {
+    const m = State.masterIndex.last8.get(l8);
+    if (m.length === 1) return { product: m[0], matchType: 'last8' };
+  }
+  return { product: null, matchType: 'none' };
+}
 
-  for (let i = 0; i < line.length; i++) {
-    const char = line[i];
-    if (char === '"') {
-      if (inQuotes && line[i + 1] === '"') {
-        current += '"';
-        i++;
-      } else {
-        inQuotes = !inQuotes;
+// API Lookup
+async function lookupProductAPI(gtin14) {
+  if (!State.apiLookupEnabled || !navigator.onLine) return null;
+  
+  const ndc = gtin14.substring(3, 13).replace(/^0+/, '');
+  const formattedNDC = ndc.padStart(11, '0');
+  const ndcDash = `${formattedNDC.slice(0,5)}-${formattedNDC.slice(5,9)}-${formattedNDC.slice(9)}`;
+  
+  // Try OpenFDA
+  try {
+    const ctrl = new AbortController();
+    setTimeout(() => ctrl.abort(), 6000);
+    const res = await fetch(`${CONFIG.API.OPEN_FDA}?search=packaging.package_ndc:"${ndcDash}"&limit=1`, { signal: ctrl.signal });
+    if (res.ok) {
+      const data = await res.json();
+      if (data.results?.length > 0) {
+        const d = data.results[0];
+        let name = d.brand_name || d.generic_name || '';
+        if (d.active_ingredients?.[0]?.strength) name += ` ${d.active_ingredients[0].strength}`;
+        if (d.dosage_form && !name.toLowerCase().includes(d.dosage_form.toLowerCase())) name += ` ${d.dosage_form}`;
+        return { name: name.trim(), source: 'OpenFDA' };
       }
-    } else if (char === delimiter && !inQuotes) {
-      result.push(current.trim());
-      current = '';
+    }
+  } catch (e) {}
+  
+  // Try DailyMed
+  try {
+    const ctrl = new AbortController();
+    setTimeout(() => ctrl.abort(), 6000);
+    const res = await fetch(`${CONFIG.API.DAILYMED}?ndc=${ndc}&pagesize=1`, { signal: ctrl.signal });
+    if (res.ok) {
+      const data = await res.json();
+      if (data.data?.length > 0) return { name: data.data[0].title, source: 'DailyMed' };
+    }
+  } catch (e) {}
+  
+  // Try OpenFoodFacts
+  try {
+    const ctrl = new AbortController();
+    setTimeout(() => ctrl.abort(), 5000);
+    const barcode = gtin14.replace(/^0+/, '');
+    const res = await fetch(`${CONFIG.API.OPEN_FOOD_FACTS}${barcode}.json`, { signal: ctrl.signal });
+    if (res.ok) {
+      const data = await res.json();
+      if (data.status === 1 && data.product?.product_name) return { name: data.product.product_name, source: 'OpenFoodFacts' };
+    }
+  } catch (e) {}
+  
+  return null;
+}
+
+// History
+async function loadHistory() {
+  try {
+    State.history = await DB.getAll('history');
+    State.history.sort((a, b) => new Date(b.scanTime) - new Date(a.scanTime));
+    State.history.forEach(e => { if (e.expiry) e.expiryStatus = getExpiryStatus(new Date(e.expiry)); });
+    filterHistory();
+    renderRecentScans();
+    updateStats();
+  } catch (err) { console.error('Load history failed:', err); }
+}
+
+async function addToHistory(entry) {
+  try {
+    const existing = await DB.findByGtinBatch(entry.gtin14, entry.batch);
+    if (existing) {
+      existing.qty = (existing.qty || 1) + (entry.qty || 1);
+      existing.scanTime = entry.scanTime;
+      await DB.put('history', existing);
+      showToast(`Updated qty: ${existing.qty}`, 'success');
     } else {
-      current += char;
+      await DB.put('history', entry);
+      showToast('Added', 'success');
     }
-  }
-  result.push(current.trim());
-  return result;
-}
-
-// ============================================================================
-// EXPORT FUNCTIONS
-// ============================================================================
-
-function exportTSV(rows) {
-  const headers = ['Scan Time', 'Raw', 'GTIN14', 'GTIN13', 'Expiry', 'Batch', 'Serial', 'Qty', 'Product Name', 'Match Type'];
-  const lines = [headers.join('\t')];
-  
-  for (const row of rows) {
-    lines.push([
-      row.scanTime || '',
-      row.raw || '',
-      row.gtin14 || '',
-      row.gtin13 || '',
-      row.expiryFormatted || '',
-      row.batch || '',
-      row.serial || '',
-      row.qty || '1',
-      row.productName || '',
-      row.matchType || ''
-    ].join('\t'));
-  }
-  
-  return lines.join('\n');
-}
-
-function exportCSV(rows) {
-  const headers = ['Scan Time', 'Raw', 'GTIN14', 'GTIN13', 'Expiry', 'Batch', 'Serial', 'Qty', 'Product Name', 'Match Type'];
-  const lines = [headers.map(h => `"${h}"`).join(',')];
-  
-  for (const row of rows) {
-    lines.push([
-      row.scanTime || '',
-      row.raw || '',
-      row.gtin14 || '',
-      row.gtin13 || '',
-      row.expiryFormatted || '',
-      row.batch || '',
-      row.serial || '',
-      row.qty || '1',
-      row.productName || '',
-      row.matchType || ''
-    ].map(v => `"${String(v).replace(/"/g, '""')}"`).join(','));
-  }
-  
-  return lines.join('\n');
-}
-
-function backupJSON() {
-  return JSON.stringify({
-    version: 1,
-    exportDate: new Date().toISOString(),
-    history: AppState.historyRows,
-    master: AppState.masterData,
-    masterLastUpdated: AppState.masterLastUpdated
-  }, null, 2);
-}
-
-async function restoreJSON(json) {
-  const data = JSON.parse(json);
-  
-  if (data.history && Array.isArray(data.history)) {
-    await clearHistory();
-    for (const entry of data.history) {
-      await saveHistory(entry);
-    }
-    AppState.historyRows = data.history;
-  }
-  
-  if (data.master && Array.isArray(data.master)) {
-    await saveMasterData(data.master);
-    AppState.masterData = data.master;
-    AppState.masterIndex = buildMasterIndex(data.master);
-    AppState.masterCount = data.master.length;
-    AppState.masterLoaded = data.master.length > 0;
-    AppState.masterLastUpdated = data.masterLastUpdated || new Date().toISOString();
+    await loadHistory();
+    Haptic.success();
+  } catch (err) {
+    console.error('Add failed:', err);
+    showToast('Failed to save', 'error');
+    Haptic.error();
   }
 }
 
-// ============================================================================
-// UI UTILITIES
-// ============================================================================
-
-function showToast(message, type = 'info') {
-  const container = document.getElementById('toastContainer');
-  const toast = document.createElement('div');
-  toast.className = `toast ${type}`;
-  toast.innerHTML = `
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20" style="color: var(--${type === 'success' ? 'success' : type === 'error' ? 'danger' : 'warning'})">
-      ${type === 'success' ? '<polyline points="20 6 9 17 4 12"></polyline>' : 
-        type === 'error' ? '<circle cx="12" cy="12" r="10"></circle><line x1="15" y1="9" x2="9" y2="15"></line><line x1="9" y1="9" x2="15" y2="15"></line>' :
-        '<circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line>'}
-    </svg>
-    <span>${message}</span>
-  `;
-  container.appendChild(toast);
-  
-  setTimeout(() => {
-    toast.style.opacity = '0';
-    toast.style.transform = 'translateX(100%)';
-    setTimeout(() => toast.remove(), 300);
-  }, 3000);
+async function updateHistoryEntry(entry) {
+  try {
+    await DB.put('history', entry);
+    await loadHistory();
+    showToast('Updated', 'success');
+  } catch (err) { showToast('Update failed', 'error'); }
 }
 
-function downloadFile(content, filename, mimeType) {
-  const blob = new Blob([content], { type: mimeType });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+async function deleteHistoryEntry(id) {
+  try {
+    await DB.delete('history', id);
+    await loadHistory();
+    showToast('Deleted', 'success');
+  } catch (err) { showToast('Delete failed', 'error'); }
 }
 
-function formatDateTime(date) {
-  const d = new Date(date);
-  return d.toLocaleDateString('en-GB', {
-    day: '2-digit',
-    month: '2-digit',
-    year: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit'
-  });
-}
-
-let confirmCallback = null;
-
-function showConfirm(title, message, callback) {
-  document.getElementById('confirmTitle').textContent = title;
-  document.getElementById('confirmMessage').textContent = message;
-  document.getElementById('confirmModal').classList.add('active');
-  confirmCallback = callback;
-}
-
-function hideConfirm() {
-  document.getElementById('confirmModal').classList.remove('active');
-  confirmCallback = null;
-}
-
-// ============================================================================
-// UI RENDERING
-// ============================================================================
-
-function updateUI() {
-  document.getElementById('historyCount').textContent = AppState.historyRows.length;
-  document.getElementById('masterCount').textContent = AppState.masterCount;
-  document.getElementById('masterTotalProducts').textContent = AppState.masterCount;
-  document.getElementById('masterUniqueGtins').textContent = AppState.masterIndex.exact.size;
-  document.getElementById('masterLastUpdated').textContent = AppState.masterLastUpdated 
-    ? formatDateTime(AppState.masterLastUpdated) 
-    : 'Never';
-  
-  document.getElementById('backupHistoryCount').textContent = AppState.historyRows.length;
-  document.getElementById('backupMasterCount').textContent = AppState.masterCount;
-  
-  const backupSize = new Blob([backupJSON()]).size;
-  document.getElementById('backupSize').textContent = (backupSize / 1024).toFixed(1) + ' KB';
-  
-  const status = document.getElementById('connectionStatus');
-  if (navigator.onLine) {
-    status.className = 'status-badge online';
-    status.innerHTML = '<span class="status-dot"></span><span>Online</span>';
-  } else {
-    status.className = 'status-badge offline';
-    status.innerHTML = '<span class="status-dot"></span><span>Offline</span>';
-  }
-  
-  renderHistoryTable();
-  renderMasterPreview();
-}
-
-function renderHistoryTable() {
-  const tbody = document.getElementById('historyBody');
-  const emptyState = document.getElementById('historyEmpty');
-  const tableContainer = document.getElementById('tableContainer');
-  
-  let filtered = [...AppState.historyRows];
-  
-  if (AppState.filters.search) {
-    const search = AppState.filters.search.toLowerCase();
-    filtered = filtered.filter(row => 
-      (row.gtin14 && row.gtin14.toLowerCase().includes(search)) ||
-      (row.gtin13 && row.gtin13.toLowerCase().includes(search)) ||
-      (row.productName && row.productName.toLowerCase().includes(search)) ||
-      (row.batch && row.batch.toLowerCase().includes(search)) ||
-      (row.serial && row.serial.toLowerCase().includes(search))
+function filterHistory() {
+  let filtered = [...State.history];
+  if (State.searchQuery) {
+    const q = State.searchQuery.toLowerCase();
+    filtered = filtered.filter(e => 
+      (e.name?.toLowerCase().includes(q)) || (e.gtin14?.includes(q)) || (e.batch?.toLowerCase().includes(q))
     );
   }
-  
-  if (AppState.filters.expired) {
-    filtered = filtered.filter(row => row.expiryStatus === 'expired');
-  }
-  if (AppState.filters.soon) {
-    filtered = filtered.filter(row => row.expiryStatus === 'soon');
-  }
-  if (AppState.filters.missing) {
-    filtered = filtered.filter(row => row.expiryStatus === 'missing');
-  }
-  
-  filtered.sort((a, b) => {
-    let aVal, bVal;
-    if (AppState.sorting.field === 'time') {
-      aVal = new Date(a.scanTime || 0).getTime();
-      bVal = new Date(b.scanTime || 0).getTime();
-    } else if (AppState.sorting.field === 'expiry') {
-      aVal = a.expiry ? new Date(a.expiry).getTime() : (AppState.sorting.direction === 'asc' ? Infinity : -Infinity);
-      bVal = b.expiry ? new Date(b.expiry).getTime() : (AppState.sorting.direction === 'asc' ? Infinity : -Infinity);
-    }
-    return AppState.sorting.direction === 'asc' ? aVal - bVal : bVal - aVal;
-  });
-  
-  const totalItems = filtered.length;
-  const totalPages = Math.max(1, Math.ceil(totalItems / AppState.pagination.perPage));
-  AppState.pagination.page = Math.min(AppState.pagination.page, totalPages);
-  
-  const startIdx = (AppState.pagination.page - 1) * AppState.pagination.perPage;
-  const endIdx = Math.min(startIdx + AppState.pagination.perPage, totalItems);
-  const pageItems = filtered.slice(startIdx, endIdx);
-  
-  if (AppState.historyRows.length === 0) {
-    tbody.innerHTML = '';
-    emptyState.style.display = 'block';
-    tableContainer.style.display = 'none';
-  } else {
-    emptyState.style.display = 'none';
-    tableContainer.style.display = 'block';
-    
-    tbody.innerHTML = pageItems.map(row => `
-      <tr>
-        <td class="mono">${formatDateTime(row.scanTime)}</td>
-        <td class="mono truncate" title="${escapeHtml(row.raw)}">${escapeHtml(row.raw).substring(0, 30)}${row.raw.length > 30 ? '...' : ''}</td>
-        <td class="mono">${row.gtin14 || '-'}</td>
-        <td class="mono">${row.gtin13 || '-'}</td>
-        <td>
-          <span class="expiry-badge ${row.expiryStatus}">
-            ${row.expiryFormatted || '-'}
-          </span>
-        </td>
-        <td class="mono">${row.batch || '-'}</td>
-        <td class="mono">${row.serial || '-'}</td>
-        <td class="mono">${row.qty || '1'}</td>
-        <td class="truncate" title="${escapeHtml(row.productName)}">${escapeHtml(row.productName) || '-'}</td>
-        <td><span class="match-badge ${row.matchType.toLowerCase().replace('-', '')}">${row.matchType}</span></td>
-      </tr>
-    `).join('');
-  }
-  
-  document.getElementById('paginationInfo').textContent = 
-    totalItems === 0 ? 'No entries' : `Showing ${startIdx + 1}-${endIdx} of ${totalItems}`;
-  document.getElementById('pageIndicator').textContent = `Page ${AppState.pagination.page} of ${totalPages}`;
-  document.getElementById('prevPageBtn').disabled = AppState.pagination.page <= 1;
-  document.getElementById('nextPageBtn').disabled = AppState.pagination.page >= totalPages;
+  if (State.activeFilter !== 'all') filtered = filtered.filter(e => e.expiryStatus === State.activeFilter);
+  State.filteredHistory = filtered;
+  renderHistory();
 }
 
-function renderMasterPreview() {
-  const tbody = document.getElementById('masterPreviewBody');
-  const emptyState = document.getElementById('masterEmpty');
-  const searchInput = document.getElementById('masterSearchInput');
+// Scanner
+async function startScanner() {
+  const placeholder = document.getElementById('scannerPlaceholder');
+  const viewfinder = document.getElementById('viewfinder');
+  const btn = document.getElementById('btnScanner');
+  const btnText = document.getElementById('btnScannerText');
   
-  if (AppState.masterData.length === 0) {
-    tbody.innerHTML = '';
-    emptyState.style.display = 'block';
-    tbody.parentElement.parentElement.style.display = 'none';
-  } else {
-    emptyState.style.display = 'none';
-    tbody.parentElement.parentElement.style.display = 'block';
+  if (State.scanning) { stopScanner(); return; }
+  
+  try {
+    placeholder.classList.add('hidden');
+    viewfinder.classList.add('active');
+    btn.classList.add('stop');
+    btnText.textContent = 'Stop Scanner';
     
-    let filtered = AppState.masterData;
-    const search = searchInput.value.toLowerCase();
-    if (search) {
-      filtered = filtered.filter(item => 
-        item.gtin.toLowerCase().includes(search) ||
-        item.name.toLowerCase().includes(search)
-      );
-    }
-    
-    const preview = filtered.slice(0, 100);
-    tbody.innerHTML = preview.map(item => `
-      <tr>
-        <td class="mono">${item.gtin}</td>
-        <td>${escapeHtml(item.name)}</td>
-      </tr>
-    `).join('');
-    
-    if (filtered.length > 100) {
-      tbody.innerHTML += `
-        <tr>
-          <td colspan="2" style="text-align: center; color: var(--text-muted);">
-            ... and ${filtered.length - 100} more products
-          </td>
-        </tr>
-      `;
-    }
+    State.scanner = new Html5Qrcode('reader');
+    await State.scanner.start(
+      { facingMode: 'environment' },
+      { fps: 10, qrbox: { width: 220, height: 120 }, aspectRatio: 1.2 },
+      onScanSuccess,
+      () => {}
+    );
+    State.scanning = true;
+    Haptic.light();
+  } catch (err) {
+    console.error('Scanner error:', err);
+    showToast('Camera access denied', 'error');
+    stopScanner();
   }
 }
 
-function escapeHtml(str) {
-  if (!str) return '';
-  const div = document.createElement('div');
-  div.textContent = str;
-  return div.innerHTML;
+function stopScanner() {
+  const placeholder = document.getElementById('scannerPlaceholder');
+  const viewfinder = document.getElementById('viewfinder');
+  const btn = document.getElementById('btnScanner');
+  const btnText = document.getElementById('btnScannerText');
+  
+  if (State.scanner) { State.scanner.stop().catch(() => {}); State.scanner = null; }
+  State.scanning = false;
+  placeholder.classList.remove('hidden');
+  viewfinder.classList.remove('active');
+  btn.classList.remove('stop');
+  btnText.textContent = 'Start Scanner';
 }
 
-// ============================================================================
-// SCAN PROCESSING
-// ============================================================================
+async function onScanSuccess(code) {
+  const now = Date.now();
+  if (code === State.lastScan.code && now - State.lastScan.time < CONFIG.DEBOUNCE_MS) return;
+  State.lastScan = { code, time: now };
+  Haptic.medium();
+  await processScan(code);
+}
 
-async function processScan(raw) {
-  const parsed = parseGs1(raw);
-  const match = matchProduct(parsed, AppState.masterIndex);
+async function processScan(code) {
+  const parsed = parseGS1(code);
+  if (!parsed.valid) { showToast('Invalid barcode', 'error'); Haptic.error(); return; }
+  
+  const match = matchProduct(parsed.gtin14);
+  let name = match.product?.name || '';
+  
+  if (!name && State.apiLookupEnabled) {
+    showToast('Looking up...', 'info');
+    const api = await lookupProductAPI(parsed.gtin14);
+    if (api) name = api.name;
+  }
   
   const entry = {
-    scanTime: new Date().toISOString(),
-    raw: raw,
     gtin14: parsed.gtin14,
     gtin13: parsed.gtin13,
+    name: name || `Unknown (${parsed.gtin14.slice(-8)})`,
     expiry: parsed.expiry,
     expiryFormatted: parsed.expiryFormatted,
     expiryStatus: parsed.expiryStatus,
     batch: parsed.batch,
     serial: parsed.serial,
-    qty: parsed.qty || '1',
-    productName: match.name,
-    matchType: parsed.valid ? match.matchType : 'INVALID'
+    qty: parsed.qty || 1,
+    matchType: match.matchType,
+    scanTime: new Date().toISOString(),
+    raw: code
   };
   
-  await saveHistory(entry);
-  AppState.historyRows.unshift(entry);
-  
-  updateRecentScan(entry);
-  updateUI();
-  
-  return entry;
+  await addToHistory(entry);
 }
 
-function updateRecentScan(entry) {
-  const container = document.getElementById('recentScan');
-  container.style.display = 'flex';
-  document.getElementById('recentGtin').textContent = entry.gtin14 || entry.raw.substring(0, 20);
-  document.getElementById('recentName').textContent = entry.productName || 'Unknown product';
-  
-  const expiryBadge = document.getElementById('recentExpiry');
-  expiryBadge.textContent = entry.expiryFormatted || 'No expiry';
-  expiryBadge.className = `expiry-badge ${entry.expiryStatus}`;
+// PIN
+function isPinValid() { return (Date.now() - State.lastPinSuccess) < CONFIG.PIN_TIMEOUT; }
+
+function requirePin(callback) {
+  if (isPinValid()) { callback(); return; }
+  State.pinCallback = callback;
+  State.pinInput = '';
+  updatePinDots();
+  document.getElementById('pinError').classList.remove('show');
+  document.getElementById('pinModal').classList.add('show');
 }
 
-// ============================================================================
-// BARCODE SCANNER
-// ============================================================================
-
-let codeReader = null;
-
-async function initScanner() {
-  try {
-    if (!('BarcodeDetector' in window)) {
-      const { BrowserMultiFormatReader } = await import('https://unpkg.com/@aspect-build/aspect-workflows-reporter@latest');
-      codeReader = new BrowserMultiFormatReader();
-    }
-  } catch (e) {
-    console.warn('ZXing library not available, using native BarcodeDetector if available');
-  }
+function onPinKey(key) {
+  if (key === 'back') State.pinInput = State.pinInput.slice(0, -1);
+  else if (key && State.pinInput.length < 4) State.pinInput += key;
+  updatePinDots();
+  Haptic.light();
+  if (State.pinInput.length === 4) verifyPin();
 }
 
-async function startScanning() {
-  const video = document.getElementById('scannerVideo');
-  const overlay = document.getElementById('scannerOverlay');
-  const viewfinder = document.getElementById('viewfinder');
-  const startBtn = document.getElementById('startScanBtn');
-  const stopBtn = document.getElementById('stopScanBtn');
-  const switchBtn = document.getElementById('switchCameraBtn');
-
-  try {
-    const constraints = {
-      video: {
-        facingMode: { ideal: 'environment' },
-        width: { ideal: 1280 },
-        height: { ideal: 720 }
-      }
-    };
-
-    AppState.cameraStream = await navigator.mediaDevices.getUserMedia(constraints);
-    video.srcObject = AppState.cameraStream;
-    await video.play();
-
-    overlay.style.display = 'none';
-    viewfinder.style.display = 'block';
-    startBtn.style.display = 'none';
-    stopBtn.style.display = 'inline-flex';
-    switchBtn.style.display = 'inline-flex';
-    AppState.scanning = true;
-
-    startBarcodeDetection(video);
-    showToast('Camera started. Point at a barcode.', 'success');
-  } catch (err) {
-    console.error('Camera error:', err);
-    showToast('Could not access camera: ' + err.message, 'error');
-  }
+function updatePinDots() {
+  document.querySelectorAll('.pin-dot').forEach((d, i) => d.classList.toggle('filled', i < State.pinInput.length));
 }
 
-function stopScanning() {
-  const video = document.getElementById('scannerVideo');
-  const overlay = document.getElementById('scannerOverlay');
-  const viewfinder = document.getElementById('viewfinder');
-  const startBtn = document.getElementById('startScanBtn');
-  const stopBtn = document.getElementById('stopScanBtn');
-  const switchBtn = document.getElementById('switchCameraBtn');
-
-  if (AppState.cameraStream) {
-    AppState.cameraStream.getTracks().forEach(track => track.stop());
-    AppState.cameraStream = null;
-  }
-
-  video.srcObject = null;
-  overlay.style.display = 'flex';
-  viewfinder.style.display = 'none';
-  startBtn.style.display = 'inline-flex';
-  stopBtn.style.display = 'none';
-  switchBtn.style.display = 'none';
-  AppState.scanning = false;
-}
-
-let lastScannedCode = '';
-let lastScanTime = 0;
-
-async function startBarcodeDetection(video) {
-  if ('BarcodeDetector' in window) {
-    const detector = new BarcodeDetector({
-      formats: ['data_matrix', 'qr_code', 'code_128', 'ean_13', 'ean_8', 'upc_a', 'upc_e']
-    });
-
-    const detectFrame = async () => {
-      if (!AppState.scanning) return;
-
-      try {
-        const barcodes = await detector.detect(video);
-        for (const barcode of barcodes) {
-          const now = Date.now();
-          if (barcode.rawValue !== lastScannedCode || now - lastScanTime > 2000) {
-            lastScannedCode = barcode.rawValue;
-            lastScanTime = now;
-            await processScan(barcode.rawValue);
-            showToast('Barcode scanned!', 'success');
-          }
-        }
-      } catch (err) {
-        console.error('Detection error:', err);
-      }
-
-      if (AppState.scanning) {
-        requestAnimationFrame(detectFrame);
-      }
-    };
-
-    detectFrame();
+function verifyPin() {
+  if (State.pinInput === CONFIG.PIN) {
+    State.lastPinSuccess = Date.now();
+    document.getElementById('pinModal').classList.remove('show');
+    Haptic.success();
+    if (State.pinCallback) { State.pinCallback(); State.pinCallback = null; }
   } else {
-    showToast('BarcodeDetector not supported. Try uploading an image.', 'warning');
+    document.getElementById('pinError').classList.add('show');
+    State.pinInput = '';
+    updatePinDots();
+    Haptic.error();
   }
 }
 
-async function processImageFile(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = async (e) => {
-      const img = new Image();
-      img.onload = async () => {
-        try {
-          if ('BarcodeDetector' in window) {
-            const detector = new BarcodeDetector({
-              formats: ['data_matrix', 'qr_code', 'code_128', 'ean_13', 'ean_8', 'upc_a', 'upc_e']
-            });
-            const barcodes = await detector.detect(img);
-            if (barcodes.length > 0) {
-              for (const barcode of barcodes) {
-                await processScan(barcode.rawValue);
-              }
-              showToast(`Found ${barcodes.length} barcode(s)`, 'success');
-              resolve(barcodes);
-            } else {
-              showToast('No barcode found in image', 'warning');
-              resolve([]);
-            }
-          } else {
-            showToast('BarcodeDetector not available', 'error');
-            reject(new Error('BarcodeDetector not available'));
-          }
-        } catch (err) {
-          reject(err);
-        }
-      };
-      img.src = e.target.result;
-    };
-    reader.readAsDataURL(file);
-  });
+// Rendering
+function renderRecentScans() {
+  const container = document.getElementById('recentScans');
+  const empty = document.getElementById('emptyRecent');
+  const recent = State.history.slice(0, CONFIG.MAX_RECENT_SCANS);
+  
+  if (recent.length === 0) {
+    empty.style.display = 'block';
+    container.innerHTML = '';
+    container.appendChild(empty);
+    return;
+  }
+  
+  empty.style.display = 'none';
+  container.innerHTML = recent.map(item => createHistoryItemHTML(item)).join('');
 }
 
-// ============================================================================
-// EVENT HANDLERS
-// ============================================================================
-
-function setupEventListeners() {
-  // Tab navigation
-  document.querySelectorAll('.nav-tab').forEach(tab => {
-    tab.addEventListener('click', () => {
-      const tabId = tab.dataset.tab;
-      switchTab(tabId);
-    });
-  });
-
-  // Scanner controls
-  document.getElementById('startScanBtn').addEventListener('click', startScanning);
-  document.getElementById('stopScanBtn').addEventListener('click', stopScanning);
+function renderHistory() {
+  const container = document.getElementById('historyList');
+  const empty = document.getElementById('emptyHistory');
   
-  // Image upload
-  document.getElementById('imageUpload').addEventListener('change', async (e) => {
-    if (e.target.files.length > 0) {
-      await processImageFile(e.target.files[0]);
-      e.target.value = '';
-    }
-  });
+  if (State.filteredHistory.length === 0) {
+    empty.style.display = 'block';
+    container.innerHTML = '';
+    container.appendChild(empty);
+    return;
+  }
+  
+  empty.style.display = 'none';
+  container.innerHTML = State.filteredHistory.map(item => createHistoryItemHTML(item)).join('');
+}
 
+function createHistoryItemHTML(item) {
+  const status = item.expiryStatus || 'ok';
+  const badgeText = status === 'expired' ? 'Expired' : status === 'expiring' ? 'Expiring' : 'OK';
+  return `
+    <div class="history-item ${status}" data-id="${item.id}">
+      <div class="item-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z"/>
+        </svg>
+      </div>
+      <div class="item-info">
+        <div class="item-name">${escapeHtml(item.name || 'Unknown')}</div>
+        <div class="item-details">${item.expiryFormatted || 'No expiry'}${item.batch ? ` • ${item.batch}` : ''}</div>
+      </div>
+      <span class="item-badge badge-${status}">${badgeText}</span>
+      <div class="item-qty">${item.qty || 1}</div>
+    </div>
+  `;
+}
+
+function escapeHtml(str) {
+  if (!str) return '';
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function updateStats() {
+  const el = document.getElementById('historyCount');
+  if (el) el.textContent = State.history.length;
+}
+
+function updateMasterStats() {
+  const el = document.getElementById('masterCount');
+  if (el) el.textContent = State.masterData.size;
+}
+
+// Toast
+function showToast(msg, type = 'info') {
+  const container = document.getElementById('toastWrap');
+  const icons = {
+    success: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6 9 17l-5-5"/></svg>',
+    error: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="m15 9-6 6M9 9l6 6"/></svg>',
+    warning: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/></svg>',
+    info: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>'
+  };
+  
+  const toast = document.createElement('div');
+  toast.className = `toast ${type}`;
+  toast.innerHTML = `<div class="toast-icon">${icons[type] || icons.info}</div><span class="toast-msg">${msg}</span>`;
+  container.appendChild(toast);
+  
+  setTimeout(() => {
+    toast.style.opacity = '0';
+    setTimeout(() => toast.remove(), 300);
+  }, 3000);
+}
+
+// Export CSV only
+function exportCSV() {
+  if (State.history.length === 0) { showToast('No data', 'warning'); return; }
+  
+  const headers = ['GTIN', 'Name', 'Expiry', 'Batch', 'Qty', 'Status', 'Scanned'];
+  const rows = State.history.map(i => [
+    i.gtin14, `"${(i.name || '').replace(/"/g, '""')}"`, i.expiryFormatted || '', i.batch || '', i.qty || 1, i.expiryStatus || '', i.scanTime || ''
+  ]);
+  
+  const csv = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `pharmacy-${new Date().toISOString().split('T')[0]}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+  showToast('Exported', 'success');
+}
+
+// Navigation
+function navigateTo(page) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById(`page-${page}`)?.classList.add('active');
+  document.querySelector(`[data-page="${page}"]`)?.classList.add('active');
+  State.currentPage = page;
+  if (page !== 'home' && State.scanning) stopScanner();
+  Haptic.light();
+}
+
+// Edit Modal
+function openEditModal(entry) {
+  State.editingEntry = entry;
+  document.getElementById('editName').value = entry.name || '';
+  document.getElementById('editQty').value = entry.qty || 1;
+  document.getElementById('editExpiry').value = entry.expiry || '';
+  document.getElementById('editBatch').value = entry.batch || '';
+  document.getElementById('editModal').classList.add('show');
+}
+
+function closeEditModal() {
+  document.getElementById('editModal').classList.remove('show');
+  State.editingEntry = null;
+}
+
+async function saveEdit() {
+  if (!State.editingEntry) return;
+  State.editingEntry.name = document.getElementById('editName').value;
+  State.editingEntry.qty = parseInt(document.getElementById('editQty').value, 10) || 1;
+  State.editingEntry.expiry = document.getElementById('editExpiry').value;
+  State.editingEntry.batch = document.getElementById('editBatch').value;
+  
+  if (State.editingEntry.expiry) {
+    const d = new Date(State.editingEntry.expiry);
+    State.editingEntry.expiryStatus = getExpiryStatus(d);
+    State.editingEntry.expiryFormatted = `${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}/${d.getFullYear()}`;
+  }
+  
+  await updateHistoryEntry(State.editingEntry);
+  closeEditModal();
+}
+
+// Confirm Modal
+let confirmCallback = null;
+function showConfirm(title, msg, cb) {
+  document.getElementById('confirmTitle').textContent = title;
+  document.getElementById('confirmMsg').textContent = msg;
+  confirmCallback = cb;
+  document.getElementById('confirmModal').classList.add('show');
+}
+function closeConfirm() {
+  document.getElementById('confirmModal').classList.remove('show');
+  confirmCallback = null;
+}
+
+// Bulk Entry
+async function processBulkEntry() {
+  const lines = document.getElementById('bulkInput').value.split(/\r?\n/).filter(l => l.trim());
+  if (lines.length === 0) { showToast('Enter barcodes', 'warning'); return; }
+  
+  let total = lines.length, valid = 0, matched = 0;
+  
+  for (const line of lines) {
+    const parsed = parseGS1(line.trim());
+    if (parsed.valid) {
+      valid++;
+      const match = matchProduct(parsed.gtin14);
+      let name = match.product?.name || '';
+      if (match.product) matched++;
+      if (!name && State.apiLookupEnabled) {
+        const api = await lookupProductAPI(parsed.gtin14);
+        if (api) name = api.name;
+      }
+      
+      await addToHistory({
+        gtin14: parsed.gtin14,
+        gtin13: parsed.gtin13,
+        name: name || `Unknown (${parsed.gtin14.slice(-8)})`,
+        expiry: parsed.expiry,
+        expiryFormatted: parsed.expiryFormatted,
+        expiryStatus: parsed.expiryStatus,
+        batch: parsed.batch,
+        qty: parsed.qty || 1,
+        matchType: match.matchType,
+        scanTime: new Date().toISOString(),
+        raw: line.trim()
+      });
+    }
+  }
+  
+  document.getElementById('statTotal').textContent = total;
+  document.getElementById('statValid').textContent = valid;
+  document.getElementById('statMatched').textContent = matched;
+  showToast(`Processed ${valid}/${total}`, 'success');
+}
+
+// Side Menu
+function closeSideMenu() {
+  document.getElementById('sideMenuBg').classList.remove('show');
+  document.getElementById('sideMenu').classList.remove('show');
+}
+
+// Settings
+async function loadSettings() {
+  try {
+    const api = await DB.get('settings', 'apiLookup');
+    if (api !== undefined) {
+      State.apiLookupEnabled = api.value;
+      document.getElementById('toggleApi').classList.toggle('on', State.apiLookupEnabled);
+    }
+    const haptic = await DB.get('settings', 'haptic');
+    if (haptic !== undefined) {
+      State.hapticEnabled = haptic.value;
+      document.getElementById('toggleHaptic').classList.toggle('on', State.hapticEnabled);
+    }
+    const updated = await DB.get('settings', 'masterUpdated');
+    if (updated) {
+      const d = new Date(updated.value);
+      document.getElementById('lastUpdated').textContent = `${d.getDate()}/${d.getMonth()+1}`;
+    }
+  } catch (e) {}
+}
+
+// Event Listeners
+function initEventListeners() {
+  // Nav
+  document.querySelectorAll('.nav-btn').forEach(b => b.addEventListener('click', () => navigateTo(b.dataset.page)));
+  
+  // Scanner
+  document.getElementById('btnScanner').addEventListener('click', startScanner);
+  
   // Manual entry
-  document.getElementById('manualAddBtn').addEventListener('click', async () => {
+  document.getElementById('btnManualAdd').addEventListener('click', () => {
     const input = document.getElementById('manualInput');
-    const raw = input.value.trim();
-    if (raw) {
-      await processScan(raw);
-      input.value = '';
-      showToast('Entry added to history', 'success');
+    if (input.value.trim()) { processScan(input.value.trim()); input.value = ''; }
+  });
+  document.getElementById('manualInput').addEventListener('keypress', e => { if (e.key === 'Enter') document.getElementById('btnManualAdd').click(); });
+  
+  // View all
+  document.getElementById('viewAllHistory').addEventListener('click', () => navigateTo('history'));
+  
+  // Search
+  document.getElementById('searchInput').addEventListener('input', e => { State.searchQuery = e.target.value; filterHistory(); });
+  
+  // Filters
+  document.querySelectorAll('.chip').forEach(c => {
+    c.addEventListener('click', () => {
+      document.querySelectorAll('.chip').forEach(x => x.classList.remove('active'));
+      c.classList.add('active');
+      State.activeFilter = c.dataset.filter;
+      filterHistory();
+    });
+  });
+  
+  // History item click
+  document.addEventListener('click', e => {
+    const item = e.target.closest('.history-item');
+    if (item) {
+      const id = parseInt(item.dataset.id, 10);
+      const entry = State.history.find(h => h.id === id);
+      if (entry) requirePin(() => openEditModal(entry));
     }
   });
-
-  document.getElementById('manualInput').addEventListener('keypress', async (e) => {
-    if (e.key === 'Enter') {
-      document.getElementById('manualAddBtn').click();
-    }
-  });
-
-  // Bulk paste
-  document.getElementById('processBulkBtn').addEventListener('click', async () => {
-    const input = document.getElementById('bulkInput');
-    const lines = input.value.split('\n').filter(line => line.trim());
-    
-    let valid = 0, invalid = 0, matched = 0;
-    
-    for (const line of lines) {
-      const entry = await processScan(line.trim());
-      if (entry.matchType !== 'INVALID') valid++;
-      else invalid++;
-      if (entry.productName) matched++;
-    }
-    
-    document.getElementById('bulkTotal').textContent = lines.length;
-    document.getElementById('bulkValid').textContent = valid;
-    document.getElementById('bulkInvalid').textContent = invalid;
-    document.getElementById('bulkMatched').textContent = matched;
-    
-    showToast(`Processed ${lines.length} entries`, 'success');
-    switchTab('history');
-  });
-
-  document.getElementById('clearBulkBtn').addEventListener('click', () => {
+  
+  // Bulk
+  document.getElementById('btnProcessBulk').addEventListener('click', processBulkEntry);
+  document.getElementById('btnClearBulk').addEventListener('click', () => {
     document.getElementById('bulkInput').value = '';
-    document.getElementById('bulkTotal').textContent = '0';
-    document.getElementById('bulkValid').textContent = '0';
-    document.getElementById('bulkInvalid').textContent = '0';
-    document.getElementById('bulkMatched').textContent = '0';
+    document.getElementById('statTotal').textContent = '0';
+    document.getElementById('statValid').textContent = '0';
+    document.getElementById('statMatched').textContent = '0';
   });
-
-  // History controls
-  let searchTimeout;
-  document.getElementById('searchInput').addEventListener('input', (e) => {
-    clearTimeout(searchTimeout);
-    searchTimeout = setTimeout(() => {
-      AppState.filters.search = e.target.value;
-      AppState.pagination.page = 1;
-      renderHistoryTable();
-    }, 300);
-  });
-
-  document.getElementById('filterExpired').addEventListener('click', (e) => {
-    AppState.filters.expired = !AppState.filters.expired;
-    AppState.filters.soon = false;
-    AppState.filters.missing = false;
-    e.target.classList.toggle('active', AppState.filters.expired);
-    document.getElementById('filterSoon').classList.remove('active');
-    document.getElementById('filterMissing').classList.remove('active');
-    AppState.pagination.page = 1;
-    renderHistoryTable();
-  });
-
-  document.getElementById('filterSoon').addEventListener('click', (e) => {
-    AppState.filters.soon = !AppState.filters.soon;
-    AppState.filters.expired = false;
-    AppState.filters.missing = false;
-    e.target.classList.toggle('active', AppState.filters.soon);
-    document.getElementById('filterExpired').classList.remove('active');
-    document.getElementById('filterMissing').classList.remove('active');
-    AppState.pagination.page = 1;
-    renderHistoryTable();
-  });
-
-  document.getElementById('filterMissing').addEventListener('click', (e) => {
-    AppState.filters.missing = !AppState.filters.missing;
-    AppState.filters.expired = false;
-    AppState.filters.soon = false;
-    e.target.classList.toggle('active', AppState.filters.missing);
-    document.getElementById('filterExpired').classList.remove('active');
-    document.getElementById('filterSoon').classList.remove('active');
-    AppState.pagination.page = 1;
-    renderHistoryTable();
-  });
-
-  document.getElementById('sortSelect').addEventListener('change', (e) => {
-    const [field, dir] = e.target.value.split('-');
-    AppState.sorting.field = field;
-    AppState.sorting.direction = dir;
-    renderHistoryTable();
-  });
-
-  document.getElementById('prevPageBtn').addEventListener('click', () => {
-    if (AppState.pagination.page > 1) {
-      AppState.pagination.page--;
-      renderHistoryTable();
-    }
-  });
-
-  document.getElementById('nextPageBtn').addEventListener('click', () => {
-    AppState.pagination.page++;
-    renderHistoryTable();
-  });
-
-  document.getElementById('exportTsvBtn').addEventListener('click', () => {
-    const content = exportTSV(AppState.historyRows);
-    downloadFile(content, `gs1-history-${Date.now()}.tsv`, 'text/tab-separated-values');
-    showToast('TSV exported', 'success');
-  });
-
-  document.getElementById('exportCsvBtn').addEventListener('click', () => {
-    const content = exportCSV(AppState.historyRows);
-    downloadFile(content, `gs1-history-${Date.now()}.csv`, 'text/csv');
-    showToast('CSV exported', 'success');
-  });
-
-  document.getElementById('copyLastBtn').addEventListener('click', () => {
-    if (AppState.historyRows.length > 0) {
-      const last = AppState.historyRows[0];
-      const tsv = [last.scanTime, last.raw, last.gtin14, last.gtin13, last.expiryFormatted, 
-                   last.batch, last.serial, last.qty, last.productName, last.matchType].join('\t');
-      navigator.clipboard.writeText(tsv);
-      showToast('Copied to clipboard', 'success');
-    }
-  });
-
-  document.getElementById('clearHistoryBtn').addEventListener('click', () => {
-    showConfirm('Clear History', 'Are you sure you want to delete all scan history? This cannot be undone.', async () => {
-      await clearHistory();
-      AppState.historyRows = [];
-      updateUI();
-      showToast('History cleared', 'success');
-    });
-  });
-
-  // Master data controls
-  const masterUploadZone = document.getElementById('masterUploadZone');
-  const masterFileInput = document.getElementById('masterFileInput');
-
-  masterUploadZone.addEventListener('click', () => masterFileInput.click());
   
-  masterUploadZone.addEventListener('dragover', (e) => {
-    e.preventDefault();
-    masterUploadZone.classList.add('dragover');
+  // Master upload
+  document.getElementById('uploadArea').addEventListener('click', () => document.getElementById('masterFileInput').click());
+  document.getElementById('masterFileInput').addEventListener('change', async e => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const text = await file.text();
+    const items = parseMasterCSV(text);
+    if (items.length > 0) await saveMasterData(items);
+    e.target.value = '';
   });
-
-  masterUploadZone.addEventListener('dragleave', () => {
-    masterUploadZone.classList.remove('dragover');
-  });
-
-  masterUploadZone.addEventListener('drop', (e) => {
-    e.preventDefault();
-    masterUploadZone.classList.remove('dragover');
-    if (e.dataTransfer.files.length > 0) {
-      handleMasterFile(e.dataTransfer.files[0]);
-    }
-  });
-
-  masterFileInput.addEventListener('change', (e) => {
-    if (e.target.files.length > 0) {
-      handleMasterFile(e.target.files[0]);
-    }
-  });
-
-  document.getElementById('appendMasterBtn').addEventListener('click', async () => {
-    if (AppState.pendingMasterData) {
-      await appendMasterData(AppState.pendingMasterData);
-      AppState.masterData = [...AppState.masterData, ...AppState.pendingMasterData];
-      AppState.masterIndex = buildMasterIndex(AppState.masterData);
-      AppState.masterCount = AppState.masterData.length;
-      AppState.masterLoaded = true;
-      AppState.masterLastUpdated = new Date().toISOString();
-      AppState.pendingMasterData = null;
-      document.getElementById('appendMasterBtn').disabled = true;
-      document.getElementById('replaceMasterBtn').disabled = true;
-      updateUI();
-      showToast('Master data appended', 'success');
-    }
-  });
-
-  document.getElementById('replaceMasterBtn').addEventListener('click', async () => {
-    if (AppState.pendingMasterData) {
-      await saveMasterData(AppState.pendingMasterData);
-      AppState.masterData = AppState.pendingMasterData;
-      AppState.masterIndex = buildMasterIndex(AppState.masterData);
-      AppState.masterCount = AppState.masterData.length;
-      AppState.masterLoaded = true;
-      AppState.masterLastUpdated = new Date().toISOString();
-      AppState.pendingMasterData = null;
-      document.getElementById('appendMasterBtn').disabled = true;
-      document.getElementById('replaceMasterBtn').disabled = true;
-      updateUI();
-      showToast('Master data replaced', 'success');
-    }
-  });
-
-  document.getElementById('clearMasterBtn').addEventListener('click', () => {
-    showConfirm('Clear Master Data', 'Are you sure you want to delete all product data?', async () => {
-      await clearMasterData();
-      AppState.masterData = [];
-      AppState.masterIndex = { exact: new Map(), last8: new Map() };
-      AppState.masterCount = 0;
-      AppState.masterLoaded = false;
-      updateUI();
-      showToast('Master data cleared', 'success');
-    });
-  });
-
-  let masterSearchTimeout;
-  document.getElementById('masterSearchInput').addEventListener('input', () => {
-    clearTimeout(masterSearchTimeout);
-    masterSearchTimeout = setTimeout(renderMasterPreview, 300);
-  });
-
-  // Backup controls
-  document.getElementById('backupBtn').addEventListener('click', () => {
-    const content = backupJSON();
-    downloadFile(content, `gs1-backup-${Date.now()}.json`, 'application/json');
-    showToast('Backup downloaded', 'success');
-  });
-
-  const restoreUploadZone = document.getElementById('restoreUploadZone');
-  const restoreFileInput = document.getElementById('restoreFileInput');
-
-  restoreUploadZone.addEventListener('click', () => restoreFileInput.click());
   
-  restoreUploadZone.addEventListener('dragover', (e) => {
-    e.preventDefault();
-    restoreUploadZone.classList.add('dragover');
+  // Toggles
+  document.getElementById('toggleApi').addEventListener('click', function() {
+    this.classList.toggle('on');
+    State.apiLookupEnabled = this.classList.contains('on');
+    DB.put('settings', { key: 'apiLookup', value: State.apiLookupEnabled });
   });
-
-  restoreUploadZone.addEventListener('dragleave', () => {
-    restoreUploadZone.classList.remove('dragover');
+  document.getElementById('toggleHaptic').addEventListener('click', function() {
+    this.classList.toggle('on');
+    State.hapticEnabled = this.classList.contains('on');
+    DB.put('settings', { key: 'haptic', value: State.hapticEnabled });
   });
-
-  restoreUploadZone.addEventListener('drop', (e) => {
-    e.preventDefault();
-    restoreUploadZone.classList.remove('dragover');
-    if (e.dataTransfer.files.length > 0) {
-      handleRestoreFile(e.dataTransfer.files[0]);
-    }
+  
+  // Export
+  document.getElementById('btnExportCSV').addEventListener('click', exportCSV);
+  
+  // Clear all
+  document.getElementById('btnClearAll').addEventListener('click', () => {
+    requirePin(() => showConfirm('Clear All', 'Delete all scan history?', async () => {
+      await DB.clear('history');
+      await loadHistory();
+      showToast('Cleared', 'success');
+    }));
   });
-
-  restoreFileInput.addEventListener('change', (e) => {
-    if (e.target.files.length > 0) {
-      handleRestoreFile(e.target.files[0]);
-    }
+  
+  // PIN
+  document.querySelectorAll('.pin-key').forEach(k => k.addEventListener('click', () => onPinKey(k.dataset.key)));
+  
+  // Edit modal
+  document.getElementById('btnCancelEdit').addEventListener('click', closeEditModal);
+  document.getElementById('btnSaveEdit').addEventListener('click', saveEdit);
+  
+  // Confirm modal
+  document.getElementById('btnConfirmNo').addEventListener('click', closeConfirm);
+  document.getElementById('btnConfirmYes').addEventListener('click', () => { if (confirmCallback) confirmCallback(); closeConfirm(); });
+  
+  // Side menu
+  document.getElementById('btnMenu').addEventListener('click', () => {
+    document.getElementById('sideMenuBg').classList.add('show');
+    document.getElementById('sideMenu').classList.add('show');
   });
-
-  document.getElementById('clearAllBtn').addEventListener('click', () => {
-    showConfirm('Clear All Data', 'This will permanently delete ALL your data including scan history and master products. Are you sure?', async () => {
-      await clearHistory();
-      await clearMasterData();
-      AppState.historyRows = [];
-      AppState.masterData = [];
-      AppState.masterIndex = { exact: new Map(), last8: new Map() };
-      AppState.masterCount = 0;
-      AppState.masterLoaded = false;
-      AppState.masterLastUpdated = null;
-      updateUI();
-      showToast('All data cleared', 'success');
-    });
+  document.getElementById('sideMenuBg').addEventListener('click', closeSideMenu);
+  document.getElementById('menuExport').addEventListener('click', () => { closeSideMenu(); exportCSV(); });
+  document.getElementById('menuClear').addEventListener('click', () => {
+    closeSideMenu();
+    requirePin(() => showConfirm('Clear', 'Delete all history?', async () => { await DB.clear('history'); await loadHistory(); showToast('Cleared', 'success'); }));
   });
-
-  // Modal controls
-  document.getElementById('closeModalBtn').addEventListener('click', hideConfirm);
-  document.getElementById('cancelConfirmBtn').addEventListener('click', hideConfirm);
-  document.getElementById('confirmActionBtn').addEventListener('click', () => {
-    if (confirmCallback) {
-      confirmCallback();
-    }
-    hideConfirm();
-  });
-
-  document.getElementById('confirmModal').addEventListener('click', (e) => {
-    if (e.target.id === 'confirmModal') {
-      hideConfirm();
-    }
-  });
-
-  // Network status
-  window.addEventListener('online', updateUI);
-  window.addEventListener('offline', updateUI);
-
-  // PWA install
-  let deferredPrompt;
-  window.addEventListener('beforeinstallprompt', (e) => {
-    e.preventDefault();
-    deferredPrompt = e;
-    document.getElementById('installBanner').classList.add('show');
-  });
-
-  document.getElementById('installBtn').addEventListener('click', async () => {
-    if (deferredPrompt) {
-      deferredPrompt.prompt();
-      const { outcome } = await deferredPrompt.userChoice;
-      if (outcome === 'accepted') {
-        showToast('App installed!', 'success');
-      }
-      deferredPrompt = null;
-      document.getElementById('installBanner').classList.remove('show');
-    }
-  });
-
-  document.getElementById('dismissInstall').addEventListener('click', () => {
-    document.getElementById('installBanner').classList.remove('show');
-  });
-
-  // Keyboard shortcuts
-  document.addEventListener('keydown', (e) => {
-    if (e.ctrlKey || e.metaKey) {
-      switch (e.key) {
-        case 's':
-          e.preventDefault();
-          startScanning();
-          break;
-        case 'b':
-          e.preventDefault();
-          const content = backupJSON();
-          downloadFile(content, `gs1-backup-${Date.now()}.json`, 'application/json');
-          showToast('Backup downloaded', 'success');
-          break;
-      }
-    }
-  });
+  document.getElementById('menuAbout').addEventListener('click', () => { closeSideMenu(); showToast('Oasis Pharmacy v3.0', 'info'); });
+  
+  // Offline
+  window.addEventListener('online', () => document.getElementById('offlineTag').classList.remove('show'));
+  window.addEventListener('offline', () => document.getElementById('offlineTag').classList.add('show'));
 }
 
-function switchTab(tabId) {
-  document.querySelectorAll('.nav-tab').forEach(tab => {
-    tab.classList.toggle('active', tab.dataset.tab === tabId);
-    tab.setAttribute('aria-selected', tab.dataset.tab === tabId);
-  });
-
-  document.querySelectorAll('.tab-panel').forEach(panel => {
-    panel.classList.toggle('active', panel.id === `tab-${tabId}`);
-  });
-
-  AppState.currentTab = tabId;
-
-  if (tabId !== 'scan' && AppState.scanning) {
-    stopScanning();
-  }
-}
-
-function handleMasterFile(file) {
-  const reader = new FileReader();
-  reader.onload = (e) => {
-    try {
-      const data = parseMasterFile(e.target.result, file.name);
-      if (data.length > 0) {
-        AppState.pendingMasterData = data;
-        document.getElementById('appendMasterBtn').disabled = false;
-        document.getElementById('replaceMasterBtn').disabled = false;
-        showToast(`Parsed ${data.length} products from file. Click Replace or Append.`, 'success');
-      } else {
-        showToast('No valid products found in file', 'error');
-      }
-    } catch (err) {
-      showToast('Error parsing file: ' + err.message, 'error');
-    }
-  };
-  reader.readAsText(file);
-}
-
-function handleRestoreFile(file) {
-  const reader = new FileReader();
-  reader.onload = async (e) => {
-    try {
-      await restoreJSON(e.target.result);
-      updateUI();
-      showToast('Backup restored successfully', 'success');
-    } catch (err) {
-      showToast('Error restoring backup: ' + err.message, 'error');
-    }
-  };
-  reader.readAsText(file);
-}
-
-// ============================================================================
-// INITIALIZATION
-// ============================================================================
-
+// Init
 async function init() {
   try {
-    await initDB();
+    await DB.init();
+    await loadMasterData();
+    await loadHistory();
+    await loadSettings();
+    initEventListeners();
     
-    const history = await loadAllHistory();
-    AppState.historyRows = history.sort((a, b) => 
-      new Date(b.scanTime).getTime() - new Date(a.scanTime).getTime()
-    );
-    
-    const master = await loadMasterData();
-    if (master.length > 0) {
-      AppState.masterData = master;
-      AppState.masterIndex = buildMasterIndex(master);
-      AppState.masterCount = master.length;
-      AppState.masterLoaded = true;
-      AppState.masterLastUpdated = await loadSetting('masterLastUpdated');
-    }
-    
-    setupEventListeners();
-    updateUI();
+    if (!navigator.onLine) document.getElementById('offlineTag').classList.add('show');
     
     if ('serviceWorker' in navigator) {
-      try {
-        await navigator.serviceWorker.register('sw.js');
-        console.log('Service Worker registered');
-      } catch (err) {
-        console.warn('Service Worker registration failed:', err);
-      }
+      navigator.serviceWorker.register('sw.js').catch(e => console.error('SW failed:', e));
     }
     
-    console.log('GS1 Parser PWA initialized');
+    console.log('✅ Oasis Pharmacy v3.0 ready');
   } catch (err) {
-    console.error('Initialization error:', err);
-    showToast('Error initializing app', 'error');
+    console.error('Init failed:', err);
+    showToast('Failed to start', 'error');
   }
 }
 
